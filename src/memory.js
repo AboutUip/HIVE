@@ -57,6 +57,9 @@ export class MemoryStore {
     this.data = blank()
     this.depth = 0
     this.openFlag = false
+    this.undoStack = []
+    this.activeUndo = null
+    this.changed = new Set()
   }
 
   open() {
@@ -66,6 +69,9 @@ export class MemoryStore {
   close() {
     this.openFlag = false
     this.depth = 0
+    this.undoStack = []
+    this.activeUndo = null
+    this.changed = new Set()
   }
 
   isOpen() {
@@ -75,6 +81,9 @@ export class MemoryStore {
   reset() {
     this.data = blank()
     this.depth = 0
+    this.undoStack = []
+    this.activeUndo = null
+    this.changed = new Set()
     this.openFlag = true
   }
 
@@ -87,19 +96,56 @@ export class MemoryStore {
     return this.depth > 0
   }
 
+  mark(table) {
+    if (!this.activeUndo) return
+    this.changed.add(table)
+    if (!this.activeUndo.has(table)) this.activeUndo.set(table, structuredClone(this.data[table]))
+  }
+
+  changedTables() {
+    return [...this.changed]
+  }
+
+  countersSnapshot() {
+    return {
+      eventSeq: this.data.eventSeq,
+      logSeq: this.data.logSeq,
+      bufferSeq: this.data.bufferSeq,
+      outboxSeq: this.data.outboxSeq
+    }
+  }
+
+  restoreCounters(snapshot) {
+    this.data.eventSeq = snapshot.eventSeq
+    this.data.logSeq = snapshot.logSeq
+    this.data.bufferSeq = snapshot.bufferSeq
+    this.data.outboxSeq = snapshot.outboxSeq
+  }
+
   transaction(fn) {
     this.require()
-    const snapshot = structuredClone(this.data)
     this.depth += 1
+    this.undoStack.push(new Map())
+    this.activeUndo = this.undoStack.at(-1)
     try {
       const result = fn()
       this.depth -= 1
+      this.undoStack.pop()
+      this.activeUndo = this.undoStack.at(-1) || null
       return result
     } catch (error) {
-      this.data = snapshot
+      const undo = this.undoStack.at(-1)
+      for (const [table, snapshot] of undo) this.data[table] = snapshot
       this.depth -= 1
+      this.undoStack.pop()
+      this.activeUndo = this.undoStack.at(-1) || null
+      if (this.depth === 0) this.changed = new Set()
       throw error
     }
+  }
+
+  clearChanged() {
+    this.changed = new Set()
   }
 
   require() {
@@ -113,11 +159,13 @@ export class MemoryStore {
 
   setMeta(key, value) {
     this.require()
+    this.mark('meta')
     this.data.meta[key] = String(value)
   }
 
   addEvent({ tick, kind, message }) {
     this.require()
+    this.mark('events')
     this.data.eventSeq += 1
     this.data.events.push({ id: this.data.eventSeq, tick, kind, message })
   }
@@ -129,6 +177,7 @@ export class MemoryStore {
 
   insertNode(node) {
     this.require()
+    this.mark('nodes')
     this.data.nodes[node.id] = {
       id: node.id,
       name: node.name,
@@ -147,6 +196,7 @@ export class MemoryStore {
 
   updateNode(id, patch) {
     this.require()
+    this.mark('nodes')
     const node = this.data.nodes[id]
     if (!node) return
     for (const key of ['name', 'role', 'region', 'ip', 'alias', 'status', 'report_period', 'last_report', 'retries', 'window_notice']) {
@@ -170,6 +220,7 @@ export class MemoryStore {
 
   insertLog(log) {
     this.require()
+    this.mark('logs')
     this.data.logSeq += 1
     this.data.logs.push({
       id: this.data.logSeq,
@@ -215,6 +266,7 @@ export class MemoryStore {
 
   deleteLogs(ids) {
     this.require()
+    this.mark('logs')
     const drop = new Set(ids)
     this.data.logs = this.data.logs.filter((row) => !drop.has(row.id))
   }
@@ -226,6 +278,7 @@ export class MemoryStore {
 
   insertReceipt(receipt) {
     this.require()
+    this.mark('receipts')
     this.data.receipts[receiptKey(receipt)] = true
   }
 
@@ -236,6 +289,7 @@ export class MemoryStore {
 
   putMaster(entry) {
     this.require()
+    this.mark('masters')
     this.data.masters[pairKey(entry.user_id, entry.data_key)] = {
       user_id: entry.user_id,
       data_key: entry.data_key,
@@ -249,6 +303,7 @@ export class MemoryStore {
 
   deleteMaster(userId, key) {
     this.require()
+    this.mark('masters')
     delete this.data.masters[pairKey(userId, key)]
   }
 
@@ -261,6 +316,7 @@ export class MemoryStore {
 
   suspendMasters(nodeId) {
     this.require()
+    this.mark('masters')
     for (const row of Object.values(this.data.masters)) {
       if (row.node_id === nodeId) row.suspended = 1
     }
@@ -268,6 +324,7 @@ export class MemoryStore {
 
   updateMasterIp(nodeId, ip) {
     this.require()
+    this.mark('masters')
     for (const row of Object.values(this.data.masters)) {
       if (row.node_id === nodeId) row.ip = ip
     }
@@ -285,6 +342,7 @@ export class MemoryStore {
 
   insertBuffer(entry) {
     this.require()
+    this.mark('buffers')
     this.data.bufferSeq += 1
     this.data.buffers.push({
       id: this.data.bufferSeq,
@@ -302,6 +360,7 @@ export class MemoryStore {
 
   updateBuffer(id, entry) {
     this.require()
+    this.mark('buffers')
     const row = this.data.buffers.find((item) => item.id === id)
     if (!row) return
     row.target_node = entry.target_node
@@ -331,11 +390,13 @@ export class MemoryStore {
 
   deleteBuffers(nodeId) {
     this.require()
+    this.mark('buffers')
     this.data.buffers = this.data.buffers.filter((row) => row.node_id !== nodeId)
   }
 
   suspendBuffers(targetNodeId) {
     this.require()
+    this.mark('buffers')
     for (const row of this.data.buffers) {
       if (row.target_node === targetNodeId) row.suspended = 1
     }
@@ -343,6 +404,7 @@ export class MemoryStore {
 
   updateBufferIp(targetNodeId, ip) {
     this.require()
+    this.mark('buffers')
     for (const row of this.data.buffers) {
       if (row.target_node === targetNodeId) row.ip = ip
     }
@@ -355,6 +417,7 @@ export class MemoryStore {
 
   putPending(entry) {
     this.require()
+    this.mark('pending')
     this.data.pending[pendingKey(entry.node_id, entry.user_id, entry.data_key)] = {
       node_id: entry.node_id,
       user_id: entry.user_id,
@@ -378,6 +441,7 @@ export class MemoryStore {
 
   deletePending(nodeId) {
     this.require()
+    this.mark('pending')
     for (const key of Object.keys(this.data.pending)) {
       if (this.data.pending[key].node_id === nodeId) delete this.data.pending[key]
     }
@@ -385,6 +449,7 @@ export class MemoryStore {
 
   suspendPending(targetNodeId) {
     this.require()
+    this.mark('pending')
     for (const row of Object.values(this.data.pending)) {
       if (row.target_node === targetNodeId) row.suspended = 1
     }
@@ -392,6 +457,7 @@ export class MemoryStore {
 
   updatePendingIp(targetNodeId, ip) {
     this.require()
+    this.mark('pending')
     for (const row of Object.values(this.data.pending)) {
       if (row.target_node === targetNodeId) row.ip = ip
     }
@@ -404,6 +470,7 @@ export class MemoryStore {
 
   insertMergeJob(job) {
     this.require()
+    this.mark('merge')
     this.data.merge = {
       id: 1,
       lost_id: job.lost_id,
@@ -414,6 +481,7 @@ export class MemoryStore {
 
   deleteMergeJob() {
     this.require()
+    this.mark('merge')
     this.data.merge = null
   }
 
@@ -425,6 +493,7 @@ export class MemoryStore {
 
   putFragment(holderId, row) {
     this.require()
+    this.mark('fragments')
     this.data.fragments[heldKey(holderId, row.user_id, row.data_key)] = {
       holder_id: holderId,
       user_id: row.user_id,
@@ -436,6 +505,7 @@ export class MemoryStore {
 
   deleteFragment(holderId, userId, key) {
     this.require()
+    this.mark('fragments')
     delete this.data.fragments[heldKey(holderId, userId, key)]
   }
 
@@ -469,6 +539,7 @@ export class MemoryStore {
 
   putIndex(holderId, entry) {
     this.require()
+    this.mark('indexes')
     this.data.indexes[heldKey(holderId, entry.user_id, entry.data_key)] = {
       holder_id: holderId,
       user_id: entry.user_id,
@@ -483,6 +554,7 @@ export class MemoryStore {
 
   deleteIndex(holderId, userId, key) {
     this.require()
+    this.mark('indexes')
     delete this.data.indexes[heldKey(holderId, userId, key)]
   }
 
@@ -504,6 +576,7 @@ export class MemoryStore {
 
   updateIndexIpByAlias(holderId, alias, ip) {
     this.require()
+    this.mark('indexes')
     for (const row of Object.values(this.data.indexes)) {
       if (row.holder_id === holderId && row.alias === alias) row.ip = ip
     }
@@ -511,6 +584,7 @@ export class MemoryStore {
 
   suspendIndexes(holderId, targetNodeId) {
     this.require()
+    this.mark('indexes')
     for (const row of Object.values(this.data.indexes)) {
       if (row.holder_id === holderId && row.node_id === targetNodeId) row.suspended = 1
     }
@@ -534,6 +608,7 @@ export class MemoryStore {
 
   insertOutbox(holderId, row) {
     this.require()
+    this.mark('outbox')
     this.data.outboxSeq += 1
     this.data.outbox.push({
       id: this.data.outboxSeq,
@@ -549,6 +624,7 @@ export class MemoryStore {
 
   deleteOutbox(holderId, ids) {
     this.require()
+    this.mark('outbox')
     const drop = new Set(ids)
     this.data.outbox = this.data.outbox.filter((row) => !(row.holder_id === holderId && drop.has(row.id)))
   }
@@ -574,6 +650,7 @@ export class MemoryStore {
 
   putRecord(holderId, row) {
     this.require()
+    this.mark('records')
     this.data.records[heldKey(holderId, row.user_id, row.data_key)] = {
       holder_id: holderId,
       user_id: row.user_id,
@@ -587,6 +664,7 @@ export class MemoryStore {
 
   deleteRecord(holderId, userId, key) {
     this.require()
+    this.mark('records')
     delete this.data.records[heldKey(holderId, userId, key)]
   }
 
@@ -621,6 +699,7 @@ export class MemoryStore {
 
   updateRecordHome(holderId, row) {
     this.require()
+    this.mark('records')
     const current = this.data.records[heldKey(holderId, row.user_id, row.data_key)]
     if (!current || current.home_node !== row.from_home) return
     current.home_node = row.home_node
@@ -631,6 +710,7 @@ export class MemoryStore {
 
   deleteRecordHome(holderId, userId, key, homeId) {
     this.require()
+    this.mark('records')
     const current = this.data.records[heldKey(holderId, userId, key)]
     if (current && current.home_node === homeId) delete this.data.records[heldKey(holderId, userId, key)]
   }
@@ -639,7 +719,8 @@ export class MemoryStore {
     this.require()
     const stamps = [
       ...Object.values(this.data.fragments).filter((row) => row.holder_id === holderId).map((row) => row.updated_at),
-      ...this.data.outbox.filter((row) => row.holder_id === holderId).map((row) => row.updated_at)
+      ...this.data.outbox.filter((row) => row.holder_id === holderId).map((row) => row.updated_at),
+      ...Object.values(this.data.indexes).filter((row) => row.holder_id === holderId).map((row) => row.updated_at)
     ]
     if (stamps.length === 0) return null
     return stamps.sort(byText).at(-1)
@@ -647,6 +728,9 @@ export class MemoryStore {
 
   clearHolder(holderId) {
     this.require()
+    this.mark('fragments')
+    this.mark('indexes')
+    this.mark('outbox')
     for (const key of Object.keys(this.data.fragments)) {
       if (this.data.fragments[key].holder_id === holderId) delete this.data.fragments[key]
     }

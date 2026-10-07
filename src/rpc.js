@@ -1,4 +1,5 @@
 import http from 'node:http'
+import https from 'node:https'
 import { timingSafeEqual } from 'node:crypto'
 
 export function fail(message, status = 400) {
@@ -63,9 +64,9 @@ function readBody(req) {
   })
 }
 
-export function serve({ host, port, token, handler }) {
+export function serve({ host, port, token, handler, tls = null }) {
   if (!token) throw fail('集群令牌不能是空的')
-  const server = http.createServer(async (req, res) => {
+  const listener = async (req, res) => {
     try {
       if (!authorized(req, token)) {
         send(res, 401, { error: '令牌不对' })
@@ -79,13 +80,15 @@ export function serve({ host, port, token, handler }) {
       const status = error.status || 500
       send(res, status, { error: error.expose ? error.message : '内部错误' })
     }
-  })
+  }
+  const server = tls ? https.createServer(tls, listener) : http.createServer(listener)
   return new Promise((resolve) => {
     server.listen(port, host, () => {
       const bound = server.address().port
       resolve({
         host,
         port: bound,
+        tls: Boolean(tls),
         close() {
           return new Promise((done) => {
             server.close(() => done())
@@ -98,10 +101,11 @@ export function serve({ host, port, token, handler }) {
   })
 }
 
-export function call({ host, port, method = 'GET', path, body, token, timeoutMs = 2000 }) {
+async function attemptOnce({ host, port, method, path, body, token, timeoutMs, tls }) {
   return new Promise((resolve, reject) => {
     const payload = body == null ? null : JSON.stringify(body)
-    const req = http.request(
+    const transport = tls ? https : http
+    const request = transport.request(
       {
         host,
         port,
@@ -111,7 +115,14 @@ export function call({ host, port, method = 'GET', path, body, token, timeoutMs 
         headers: {
           authorization: `Bearer ${token}`,
           ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {})
-        }
+        },
+        ...(tls
+          ? {
+              ca: tls.ca,
+              rejectUnauthorized: tls.rejectUnauthorized !== false,
+              ...(tls.servername && !/^\d+\.\d+\.\d+\.\d+$/.test(tls.servername) ? { servername: tls.servername } : {})
+            }
+          : {})
       },
       (res) => {
         const chunks = []
@@ -134,14 +145,28 @@ export function call({ host, port, method = 'GET', path, body, token, timeoutMs 
         })
       }
     )
-    req.on('timeout', () => {
-      req.destroy()
+    request.on('timeout', () => {
+      request.destroy()
       reject(fail('连接超时', 504))
     })
-    req.on('error', () => reject(fail('无法连接', 502)))
-    if (payload) req.write(payload)
-    req.end()
+    request.on('error', () => reject(fail('无法连接', 502)))
+    if (payload) request.write(payload)
+    request.end()
   })
+}
+
+export async function call({ host, port, method = 'GET', path, body, token, timeoutMs = 2000, retries = 0, tls = null }) {
+  let last = null
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await attemptOnce({ host, port, method, path, body, token, timeoutMs, tls })
+    } catch (error) {
+      last = error
+      if (error.status && error.status < 500) break
+      if (attempt < retries) await delay(50 * 2 ** attempt)
+    }
+  }
+  throw last
 }
 
 export function delay(ms) {

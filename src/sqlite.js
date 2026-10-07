@@ -807,9 +807,11 @@ export class SqliteStore {
            SELECT updated_at FROM fragments WHERE holder_id = ?
            UNION ALL
            SELECT updated_at FROM outbox WHERE holder_id = ?
+           UNION ALL
+           SELECT updated_at FROM index_entries WHERE holder_id = ?
          )`
       )
-      .get(holderId, holderId)
+      .get(holderId, holderId, holderId)
     return row?.at || null
   }
 

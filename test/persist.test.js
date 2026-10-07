@@ -38,7 +38,7 @@ test('关闭后用同一个目录重新打开', () => {
   assert.equal(nodeOf(again, 'svc-b').indexEntries.find((row) => row.data_key === 'A').node_id, 'svc-a')
   again.write({ nodeId: 'svc-a', userId: '甲', entries: [{ key: 'B', value: '后写' }] })
   const stamps = nodeOf(again, 'svc-a').fragments.map((row) => row.updated_at)
-  assert.ok(stamps.find((item) => item.endsWith('.001Z')))
+  assert.ok(stamps.find((item) => item.startsWith('2026-03-01T00:00:00.000Z-000001')))
   again.close()
   fs.rmSync(dir, { recursive: true, force: true })
 })

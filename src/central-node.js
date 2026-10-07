@@ -1,6 +1,6 @@
-import fs from 'node:fs'
 import path from 'node:path'
 import { FileStore } from './file-store.js'
+import { appendRetained } from './retain.js'
 import { call, fail, parseAddress, serve } from './rpc.js'
 import { collapseLogs, putMaster, rejectsOlder, removeMaster } from './rules.js'
 
@@ -22,6 +22,8 @@ class Central {
     this.token = options.token
     this.host = options.host || '127.0.0.1'
     this.port = options.port ?? 0
+    this.tls = options.tls || null
+    this.callTimeoutMs = positive(options.callTimeoutMs ?? 2000, '调用超时')
     this.clock = options.clock || (() => Date.now())
     this.reportIntervalMs = positive(options.reportIntervalMs ?? 2000, '上报间隔')
     this.drIntervalMs = positive(options.drIntervalMs ?? 6000, '灾备间隔')
@@ -31,8 +33,10 @@ class Central {
     this.nodeSeq = options.nodeSeq || 1
     this.retentionFile = options.retentionFile || path.join(options.dataDir, 'retained.log')
     this.retention = Boolean(options.retention)
+    this.retentionMaxBytes = positive(options.retentionMaxBytes ?? 10 * 1024 * 1024, '留档轮转大小')
     this.configured = options.nodes.map((node, index) => normalize(node, index))
     this.store = options.store || new FileStore(options.dataDir)
+    this.acceptedLogs = 0
     this.http = null
     this.timer = null
     this.working = false
@@ -45,6 +49,7 @@ class Central {
       host: this.host,
       port: this.port,
       token: this.token,
+      tls: this.tls,
       handler: (request) => this.route(request)
     })
     this.timer = setInterval(() => {
@@ -98,7 +103,29 @@ class Central {
     if (method === 'POST' && path === '/v1/ready') return { body: this.ready(body || {}) }
     if (method === 'POST' && path === '/v1/loss') return { body: await this.lose(body?.nodeId, body?.cause || '节点申请挂失') }
     if (method === 'POST' && path === '/v1/window') return { body: this.window(body || {}) }
+    if (method === 'GET' && path === '/v1/health') return { body: this.health() }
     throw fail('没有这个接口', 404)
+  }
+
+  health() {
+    const job = this.store.getMergeJob()
+    return {
+      role: 'central',
+      ok: true,
+      now: this.clock(),
+      acceptedLogs: this.acceptedLogs,
+      nodes: this.services().map((node) => ({
+        id: node.id,
+        name: node.name,
+        status: node.status,
+        ip: node.ip,
+        last_report: node.last_report,
+        retries: node.retries
+      })),
+      mergeJob: job ? { lostId: job.lost_id, targetId: job.target_id, startedAt: job.started_tick } : null,
+      logCount: this.store.countLogs(),
+      pendingCount: this.services().reduce((sum, node) => sum + this.store.listPending(node.id).length, 0)
+    }
   }
 
   node(id) {
@@ -149,6 +176,7 @@ class Central {
         }
         const duplicate = this.store.hasReceipt(receipt)
         if (!duplicate) {
+          this.acceptedLogs += 1
           this.store.insertReceipt(receipt)
           this.store.insertLog({
             tick: this.clock(),
@@ -251,7 +279,7 @@ class Central {
       if (entries.length === 0) continue
       try {
         const { host, port } = parseAddress(node.ip)
-        await call({ host, port, method: 'POST', path: '/v1/index', body: { entries }, token: this.token })
+        await call({ host, port, method: 'POST', path: '/v1/index', body: { entries }, token: this.token, timeoutMs: this.callTimeoutMs, retries: 1, tls: this.tls })
         this.store.transaction(() => this.store.deletePending(node.id))
       } catch {
         // 留到下次联系再送。
@@ -277,7 +305,7 @@ class Central {
       try {
         if (!node.ip) throw fail('无法连接')
         const { host, port } = parseAddress(node.ip)
-        const listed = await call({ host, port, method: 'GET', path: '/v1/outbox', token: this.token })
+        const listed = await call({ host, port, method: 'GET', path: '/v1/outbox', token: this.token, timeoutMs: this.callTimeoutMs, tls: this.tls })
         await this.accept(node.id, listed.entries || [])
       } catch {
         const fresh = this.node(node.id)
@@ -316,7 +344,7 @@ class Central {
       if (node.id === lostId || node.status === 'lost' || !node.ip) continue
       try {
         const { host, port } = parseAddress(node.ip)
-        await call({ host, port, method: 'POST', path: '/v1/suspend', body: entry, token: this.token })
+        await call({ host, port, method: 'POST', path: '/v1/suspend', body: entry, token: this.token, timeoutMs: this.callTimeoutMs, retries: 1, tls: this.tls })
       } catch {
         // 下次上报时索引仍以中央为准，读路径看到挂起后不会发出。
       }
@@ -329,7 +357,7 @@ class Central {
       if (node.id === excludeId || node.status !== 'up' || !node.ip) continue
       try {
         const { host, port } = parseAddress(node.ip)
-        const body = await call({ host, port, method: 'GET', path: '/v1/count', token: this.token })
+        const body = await call({ host, port, method: 'GET', path: '/v1/count', token: this.token, timeoutMs: this.callTimeoutMs, tls: this.tls })
         ranked.push({ node, count: Number(body.count) || 0 })
       } catch {
         // 连不上的节点不参与接替。
@@ -356,7 +384,10 @@ class Central {
         method: 'POST',
         path: '/v1/merge',
         body: { records },
-        token: this.token
+        token: this.token,
+        timeoutMs: this.callTimeoutMs,
+        retries: 1,
+        tls: this.tls
       })
       winners = dedupe(merged.winners || [])
     } catch (error) {
@@ -402,7 +433,7 @@ class Central {
     for (const dr of this.store.listNodes()) {
       if (dr.role !== 'dr' || !dr.covers.includes(homeId) || !dr.ip) continue
       const { host, port } = parseAddress(dr.ip)
-      const body = await call({ host, port, method: 'GET', path: `/v1/records?home=${encodeURIComponent(homeId)}`, token: this.token })
+      const body = await call({ host, port, method: 'GET', path: `/v1/records?home=${encodeURIComponent(homeId)}`, token: this.token, timeoutMs: this.callTimeoutMs, retries: 1, tls: this.tls })
       records.push(...(body.records || []))
     }
     return records
@@ -419,7 +450,10 @@ class Central {
         method: 'POST',
         path: '/v1/retarget',
         body: { lostId, targetId: target.id, keep, records: winners, organizedTick: this.clock() },
-        token: this.token
+        token: this.token,
+        timeoutMs: this.callTimeoutMs,
+        retries: 1,
+        tls: this.tls
       })
     }
   }
@@ -486,7 +520,7 @@ class Central {
       const dr = this.node(drId)
       if (!dr.ip) throw fail(`${dr.name}还没有连上`)
       const { host, port } = parseAddress(dr.ip)
-      await call({ host, port, method: 'POST', path: '/v1/apply', body: batch, token: this.token })
+      await call({ host, port, method: 'POST', path: '/v1/apply', body: batch, token: this.token, timeoutMs: this.callTimeoutMs, retries: 1, tls: this.tls })
       stored += batch.upserts.length
     }
     if (this.store.getMeta('retention') === '1') this.keep(logs)
@@ -498,7 +532,6 @@ class Central {
   }
 
   keep(logs) {
-    fs.mkdirSync(path.dirname(this.retentionFile), { recursive: true })
     const lines = logs
       .map((log) =>
         JSON.stringify({
@@ -510,8 +543,7 @@ class Central {
           source: log.source_node
         })
       )
-      .join('\n')
-    fs.appendFileSync(this.retentionFile, `${lines}\n`)
+    appendRetained(this.retentionFile, lines, this.retentionMaxBytes)
   }
 
   async join(body) {
@@ -522,7 +554,7 @@ class Central {
     const source = await this.lowestLoad('')
     if (!source) throw fail('现在没有正在服务的节点可以提供索引')
     const { host, port } = parseAddress(source.ip)
-    const temporary = await call({ host, port, method: 'GET', path: '/v1/temporary-index', token: this.token })
+    const temporary = await call({ host, port, method: 'GET', path: '/v1/temporary-index', token: this.token, timeoutMs: this.callTimeoutMs, retries: 1, tls: this.tls })
     const seq = Number(this.store.getMeta('node_seq'))
     const id = String(this.store.getMeta('new_node_id')).replaceAll('{seq}', String(seq))
     const name = String(body.name || '').trim() || `${region}节点`

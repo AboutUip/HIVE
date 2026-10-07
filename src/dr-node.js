@@ -21,6 +21,8 @@ class Dr {
     this.covers = [...new Set((options.covers || []).map((item) => String(item)))]
     this.host = options.host || '127.0.0.1'
     this.port = options.port ?? 0
+    this.tls = options.tls || null
+    this.callTimeoutMs = positive(options.callTimeoutMs ?? 2000, '调用超时')
     this.central = options.central
     this.helloTimeoutMs = options.helloTimeoutMs ?? 5000
     this.store = options.store || new FileStore(options.dataDir)
@@ -33,10 +35,17 @@ class Dr {
       host: this.host,
       port: this.port,
       token: this.token,
+      tls: this.tls,
       handler: (request) => this.route(request)
     })
     this.address = `${this.host}:${this.http.port}`
-    await this.announce()
+    try {
+      await this.announce()
+    } catch (error) {
+      await this.http.close()
+      this.http = null
+      throw error
+    }
     return this
   }
 
@@ -51,6 +60,8 @@ class Dr {
           method: 'POST',
           path: '/v1/hello',
           token: this.token,
+          timeoutMs: this.callTimeoutMs,
+          tls: this.tls,
           body: {
             id: this.id,
             name: this.name,
@@ -72,9 +83,21 @@ class Dr {
 
   route({ method, path, query, body }) {
     if (method === 'POST' && path === '/v1/apply') return { body: this.apply(body || {}) }
-    if (method === 'GET' && path === '/v1/records') return { body: { records: this.records(query.get('home')) } }
+    if (method === 'GET' && path === '/v1/records') return { body: { records: this.records(query.get('home') || '') } }
     if (method === 'POST' && path === '/v1/retarget') return { body: this.retarget(body || {}) }
+    if (method === 'GET' && path === '/v1/health') return { body: this.health() }
     throw fail('没有这个接口', 404)
+  }
+
+  health() {
+    return {
+      role: 'dr',
+      ok: true,
+      id: this.id,
+      name: this.name,
+      covers: [...this.covers],
+      records: this.store.listRecords(this.id).length
+    }
   }
 
   apply(body) {
@@ -94,6 +117,7 @@ class Dr {
   }
 
   records(home) {
+    if (!home) return this.store.listRecords(this.id)
     return this.store.listRecordsByHome(this.id, home)
   }
 
@@ -123,4 +147,10 @@ class Dr {
     this.http = null
     this.store.close()
   }
+}
+
+function positive(value, label) {
+  const number = Number(value)
+  if (!Number.isInteger(number) || number < 1) throw fail(`${label}必须是不小于 1 的整数`)
+  return number
 }

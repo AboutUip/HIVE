@@ -1,7 +1,8 @@
-import fs from 'node:fs'
 import path from 'node:path'
 import { defaultConfigPath, loadConfig } from './config.js'
 import { FileStore } from './file-store.js'
+import { HybridClock } from './hlc.js'
+import { appendRetained } from './retain.js'
 import { assertStore } from './store.js'
 
 function fail(message) {
@@ -20,9 +21,10 @@ export class Hive {
     this.dataDir = dataDir
     this.now = options.now || (() => new Date())
     this.retentionFile = options.retentionFile || path.join(dataDir, 'retained.log')
+    this.retentionMaxBytes = options.retentionMaxBytes || 10 * 1024 * 1024
     this.store = options.store || new FileStore(dataDir)
     assertStore(this.store)
-    this.lastAt = new Map()
+    this.clocks = new Map()
     this.unreachable = new Set()
     this.indexDeaf = new Set()
     this.dbBroken = new Set()
@@ -50,9 +52,21 @@ export class Hive {
       if (node.role !== 'service') continue
       const stamp = this.store.latestStamp(node.id)
       if (!stamp) continue
-      const ms = Date.parse(stamp)
-      if (Number.isFinite(ms)) this.lastAt.set(node.id, ms)
+      this.clocks.set(node.id, new HybridClock({ now: this.now, stamp }))
     }
+  }
+
+  clockFor(nodeId) {
+    let clock = this.clocks.get(nodeId)
+    if (!clock) {
+      clock = new HybridClock({ now: this.now })
+      this.clocks.set(nodeId, clock)
+    }
+    return clock
+  }
+
+  observeInto(nodeId, stamp) {
+    this.clockFor(nodeId).observe(stamp)
   }
 
   finish(outcome) {
@@ -61,7 +75,7 @@ export class Hive {
 
   reset() {
     const config = this.currentConfig()
-    this.lastAt.clear()
+    this.clocks.clear()
     this.unreachable.clear()
     this.indexDeaf.clear()
     this.dbBroken.clear()
@@ -134,13 +148,7 @@ export class Hive {
   }
 
   issuedAt(nodeId) {
-    const raw = this.now()
-    const parsed = raw instanceof Date ? raw.getTime() : Date.parse(String(raw))
-    let ms = Number.isFinite(parsed) ? parsed : Date.now()
-    const last = this.lastAt.get(nodeId) ?? 0
-    if (ms <= last) ms = last + 1
-    this.lastAt.set(nodeId, ms)
-    return new Date(ms).toISOString()
+    return this.clockFor(nodeId).issue()
   }
 
   event(tick, kind, message) {
@@ -749,6 +757,7 @@ export class Hive {
   }
 
   applyIndex(nodeId, entry, tick) {
+    this.observeInto(nodeId, entry.updated_at)
     const current = this.store.getIndex(nodeId, entry.user_id, entry.data_key)
     if (current && current.updated_at > entry.updated_at) return
     this.store.putIndex(nodeId, {
@@ -773,6 +782,7 @@ export class Hive {
   }
 
   applyDelete(nodeId, entry, tick) {
+    this.observeInto(nodeId, entry.updated_at)
     const current = this.store.getIndex(nodeId, entry.user_id, entry.data_key)
     if (!current || current.updated_at <= entry.updated_at) {
       this.store.deleteIndex(nodeId, entry.user_id, entry.data_key)
@@ -835,7 +845,6 @@ export class Hive {
       }
     }
     if (this.meta('retention') === '1') {
-      fs.mkdirSync(path.dirname(this.retentionFile), { recursive: true })
       const lines = logs
         .map((log) =>
           JSON.stringify({
@@ -847,8 +856,7 @@ export class Hive {
             source: log.source_node
           })
         )
-        .join('\n')
-      fs.appendFileSync(this.retentionFile, `${lines}\n`)
+      appendRetained(this.retentionFile, lines, this.retentionMaxBytes)
     }
     this.store.deleteLogs(logs.map((log) => log.id))
     return stored
@@ -900,6 +908,7 @@ export class Hive {
     this.insertNode(node, 'joining', this.tick())
     const temporary = this.temporaryIndex(source)
     for (const row of temporary.rows) {
+      this.observeInto(node.id, row.updated_at)
       this.store.putIndex(node.id, {
         user_id: row.user_id,
         data_key: row.data_key,
@@ -1099,6 +1108,7 @@ export class Hive {
     let loaded = 0
     for (const record of unique) {
       if (!this.canReach(target.id) || this.dbBroken.has(target.id)) throw fail('接替节点无法访问')
+      this.observeInto(target.id, record.updated_at)
       const local = this.store.getFragment(target.id, record.user_id, record.data_key)
       let winning = record
       if (local && local.updated_at > record.updated_at) {

@@ -2,6 +2,7 @@
   "name": "hive",
   "version": "0.1.0",
   "description": "区域化数据存储。数据留在写下它的节点，索引只记地址，灾备完成恢复和所有权转移。",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
@@ -13,7 +14,8 @@
     "dist",
     "config",
     "docs",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20.0.0"
@@ -23,7 +25,9 @@
     "prepare": "node scripts/build.js",
     "pretest": "node scripts/build.js",
     "test": "node --disable-warning=ExperimentalWarning --test",
-    "example": "node --disable-warning=ExperimentalWarning examples/quickstart.js"
+    "example": "node --disable-warning=ExperimentalWarning examples/quickstart.js",
+    "prepack": "node scripts/build.js",
+    "pack:check": "npm pack --dry-run"
   },
   "devDependencies": {
     "esbuild": "^0.25.10"

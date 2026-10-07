@@ -1,4 +1,5 @@
 import { FileStore } from './file-store.js'
+import { HybridClock } from './hlc.js'
 import { call, delay, fail, parseAddress, serve } from './rpc.js'
 import { applyLocal } from './rules.js'
 
@@ -17,17 +18,25 @@ class Service {
     this.dataDir = options.dataDir
     this.host = options.host || '127.0.0.1'
     this.port = options.port ?? 0
+    this.tls = options.tls || null
+    this.callTimeoutMs = positive(options.callTimeoutMs ?? 2000, '调用超时')
     this.central = options.central
     this.now = options.now || (() => new Date())
     this.reportIntervalMs = positive(options.reportIntervalMs ?? 2000, '上报间隔')
     this.helloTimeoutMs = options.helloTimeoutMs ?? 5000
+    this.maxOutbox = positive(options.maxOutbox ?? 10_000, '待上报上限')
+    this.readBreakerFails = positive(options.readBreakerFails ?? 3, '熔断阈值')
+    this.readBreakerCooldownMs = positive(options.readBreakerCooldownMs ?? 30_000, '熔断冷却')
     this.join = Boolean(options.join)
     this.id = options.id
     this.name = options.name
     this.region = options.region
     this.alias = options.alias || options.id
     this.store = options.store || new FileStore(options.dataDir)
-    this.lastAt = 0
+    this.clock = null
+    this.counters = { writes: 0, reads: 0, reports: 0 }
+    this.fetchFails = new Map()
+    this.fetchCooldown = new Map()
     this.joining = false
     this.http = null
     this.timer = null
@@ -36,19 +45,23 @@ class Service {
   async start() {
     this.store.open()
     const stamp = this.id ? this.store.latestStamp(this.id) : null
-    if (stamp) {
-      const ms = Date.parse(stamp)
-      if (Number.isFinite(ms)) this.lastAt = ms
-    }
+    this.clock = new HybridClock({ now: this.now, stamp })
     this.http = await serve({
       host: this.host,
       port: this.port,
       token: this.token,
+      tls: this.tls,
       handler: (request) => this.route(request)
     })
     this.address = `${this.host}:${this.http.port}`
-    if (this.join) await this.joinCluster()
-    else await this.announce()
+    try {
+      if (this.join) await this.joinCluster()
+      else await this.announce()
+    } catch (error) {
+      await this.http.close()
+      this.http = null
+      throw error
+    }
     this.timer = setInterval(() => {
       if (!this.joining) this.report().catch(() => {})
     }, this.reportIntervalMs)
@@ -95,6 +108,7 @@ class Service {
     this.joining = true
     this.store.transaction(() => {
       for (const row of created.index || []) {
+        this.clock.observe(row.updated_at)
         this.store.putIndex(this.id, {
           user_id: row.user_id,
           data_key: row.data_key,
@@ -112,7 +126,10 @@ class Service {
     if (!this.joining) throw fail(`${this.name}不在对齐过程中`)
     const body = await this.centralCall('POST', '/v1/ready', { nodeId: this.id })
     this.store.transaction(() => {
-      for (const entry of body.indexes || []) applyLocal(this.store, this.id, entry)
+      for (const entry of body.indexes || []) {
+        this.clock.observe(entry.updated_at)
+        applyLocal(this.store, this.id, entry)
+      }
     })
     this.joining = false
     return { message: `${this.name}已就绪` }
@@ -123,10 +140,29 @@ class Service {
     if (method === 'GET' && path === '/v1/count') return { body: { count: this.store.countFragments(this.id) } }
     if (method === 'GET' && path === '/v1/outbox') return { body: { entries: this.outboxEntries() } }
     if (method === 'GET' && path === '/v1/temporary-index') return { body: { rows: this.temporaryIndex() } }
+    if (method === 'GET' && path === '/v1/fragments') return { body: { rows: this.store.listFragments(this.id) } }
     if (method === 'POST' && path === '/v1/index') return { body: this.takeIndex(body || {}) }
     if (method === 'POST' && path === '/v1/suspend') return { body: this.suspend(body || {}) }
     if (method === 'POST' && path === '/v1/merge') return { body: this.merge(body || {}) }
+    if (method === 'GET' && path === '/v1/health') return { body: this.health() }
     throw fail('没有这个接口', 404)
+  }
+
+  health() {
+    return {
+      role: 'service',
+      ok: true,
+      id: this.id,
+      name: this.name,
+      status: this.joining ? 'joining' : 'up',
+      counters: { ...this.counters },
+      fragments: this.store.countFragments(this.id),
+      outbox: this.store.countOutbox(this.id),
+      indexes: this.store.listIndexes(this.id).length,
+      readBreakers: [...this.fetchCooldown.keys()]
+        .filter((alias) => this.breakerOpen(alias))
+        .map((alias) => ({ alias, open: true }))
+    }
   }
 
   readLocal(userId, key) {
@@ -166,7 +202,10 @@ class Service {
 
   takeIndex(body) {
     this.store.transaction(() => {
-      for (const entry of body.entries || []) applyLocal(this.store, this.id, entry)
+      for (const entry of body.entries || []) {
+        this.clock.observe(entry.updated_at)
+        applyLocal(this.store, this.id, entry)
+      }
     })
     return { ok: true }
   }
@@ -180,6 +219,7 @@ class Service {
     const winners = []
     this.store.transaction(() => {
       for (const record of body.records || []) {
+        this.clock.observe(record.updated_at)
         const local = this.store.getFragment(this.id, record.user_id, record.data_key)
         if (local && local.updated_at > record.updated_at) {
           winners.push({
@@ -208,6 +248,7 @@ class Service {
   }
 
   async write({ userId, entries }) {
+    this.counters.writes += 1
     try {
       return await this.writeEntries({ userId, entries })
     } catch (error) {
@@ -221,6 +262,9 @@ class Service {
     const user = String(userId || '').trim()
     if (!user) throw fail('先写上用户是谁')
     if (!Array.isArray(entries) || entries.length === 0) throw fail('这次没有要写入的内容')
+    if (this.store.countOutbox(this.id) >= this.maxOutbox) {
+      throw fail('待上报积压超过上限，中央可能联系不上')
+    }
     const written = []
     for (const entry of entries) {
       const key = String(entry.key || '').trim()
@@ -258,6 +302,9 @@ class Service {
     const user = String(userId || '').trim()
     if (!user) throw fail('先写上用户是谁')
     if (!Array.isArray(keys) || keys.length === 0) throw fail('先指定要删除的键')
+    if (this.store.countOutbox(this.id) >= this.maxOutbox) {
+      throw fail('待上报积压超过上限，中央可能联系不上')
+    }
     const removed = []
     for (const raw of keys) {
       const key = String(raw || '').trim()
@@ -282,6 +329,7 @@ class Service {
   }
 
   async read({ userId, keys }) {
+    this.counters.reads += 1
     try {
       return await this.readKeys({ userId, keys })
     } catch (error) {
@@ -309,9 +357,9 @@ class Service {
     const index = this.store.getIndex(this.id, user, key)
     if (!index) return { key, source: 'rejected', message: '本地没有，索引里也没有，拒绝' }
     if (index.suspended) return { key, source: 'suspended', fromIp: index.ip, message: '索引已挂起，请求未发出' }
-    const direct = await this.fetch(index.ip, user, key)
+    const direct = await this.fetchGuarded(index, user, key)
     if (direct.status === 'ok') {
-      return { key, value: direct.value, source: 'remote', storedLocally: false, fromIp: index.ip, via: 'ip', message: `从 ${index.ip} 取回，未写入本机` }
+      return { key, value: direct.value, source: 'remote', storedLocally: false, fromNodeId: index.node_id, fromIp: index.ip, via: 'ip', message: `从 ${index.ip} 取回，未写入本机` }
     }
     if (direct.status === 'missing') {
       return { key, source: 'rejected', fromIp: index.ip, message: `索引指向 ${index.ip}，但那里已经没有这份数据` }
@@ -353,13 +401,37 @@ class Service {
         port,
         method: 'GET',
         path: `/v1/data?userId=${encodeURIComponent(user)}&key=${encodeURIComponent(key)}`,
-        token: this.token
+        token: this.token,
+        timeoutMs: this.callTimeoutMs,
+        tls: this.tls
       })
       if (!body.found) return { status: 'missing' }
       return { status: 'ok', value: body.value }
     } catch {
       return { status: 'down' }
     }
+  }
+
+  breakerOpen(alias) {
+    const until = this.fetchCooldown.get(alias)
+    return Boolean(until && Date.now() < until)
+  }
+
+  async fetchGuarded(index, user, key) {
+    if (this.breakerOpen(index.alias)) return { status: 'down' }
+    const result = await this.fetch(index.ip, user, key)
+    if (result.status === 'down') {
+      const fails = (this.fetchFails.get(index.alias) || 0) + 1
+      this.fetchFails.set(index.alias, fails)
+      if (fails >= this.readBreakerFails) {
+        this.fetchFails.set(index.alias, 0)
+        this.fetchCooldown.set(index.alias, Date.now() + this.readBreakerCooldownMs)
+      }
+    } else {
+      this.fetchFails.delete(index.alias)
+      this.fetchCooldown.delete(index.alias)
+    }
+    return result
   }
 
   list({ userId } = {}) {
@@ -374,6 +446,7 @@ class Service {
   }
 
   async report() {
+    this.counters.reports += 1
     try {
       return await this.sendReport()
     } catch (error) {
@@ -424,16 +497,11 @@ class Service {
   }
 
   issuedAt() {
-    const raw = this.now()
-    const parsed = raw instanceof Date ? raw.getTime() : Date.parse(String(raw))
-    let ms = Number.isFinite(parsed) ? parsed : Date.now()
-    if (ms <= this.lastAt) ms = this.lastAt + 1
-    this.lastAt = ms
-    return new Date(ms).toISOString()
+    return this.clock.issue()
   }
 
   centralCall(method, path, body) {
-    return call({ host: this.central.host, port: this.central.port, method, path, body, token: this.token })
+    return call({ host: this.central.host, port: this.central.port, method, path, body, token: this.token, timeoutMs: this.callTimeoutMs, tls: this.tls })
   }
 
   async close() {

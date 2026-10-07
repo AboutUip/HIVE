@@ -109,7 +109,7 @@ function utcOnTheWritingNode() {
   const first = fragment('svc-a', 'A').updated_at
   hive.write({ nodeId: 'svc-a', userId: '甲', entries: [{ key: 'A', value: '后写' }] })
   const second = fragment('svc-a', 'A')
-  check(first.endsWith('Z') && second.updated_at.endsWith('Z'), '时间是 UTC')
+  check(/\.\d{3}Z-\d{6}$/.test(first) && /\.\d{3}Z-\d{6}$/.test(second.updated_at), '时间是这台节点自己的 HLC')
   check(second.updated_at > first, '后写的时间更晚，不跟中央对时')
   check(second.value === '后写', '同一节点上后写的值留下')
   check(hive.getState().clock === undefined, '中央不再发统一时钟')
