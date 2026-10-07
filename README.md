@@ -4,6 +4,8 @@
 
 **区域化数据存储 · 数据留在写下它的节点 · 索引只记地址 · 灾备完成恢复与所有权转移**
 
+<img src="docs/banner.png" alt="蜂巢 — 区域化数据存储" width="100%"/>
+
 <br/>
 
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?logo=nodedotjs&logoColor=white)](package.json)
