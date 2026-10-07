@@ -1,0 +1,30 @@
+{
+  "name": "hive",
+  "version": "0.1.0",
+  "description": "区域化数据存储。数据留在写下它的节点，索引只记地址，灾备完成恢复和所有权转移。",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./config": "./config/default.json"
+  },
+  "files": [
+    "dist",
+    "config",
+    "docs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "prepare": "node scripts/build.js",
+    "pretest": "node scripts/build.js",
+    "test": "node --disable-warning=ExperimentalWarning --test",
+    "example": "node --disable-warning=ExperimentalWarning examples/quickstart.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.10"
+  }
+}

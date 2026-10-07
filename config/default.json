@@ -1,0 +1,50 @@
+{
+  "syncPeriod": 2,
+  "drPeriod": 6,
+  "reportTolerance": 1,
+  "nodeSeq": 4,
+  "newNodeId": "svc-{seq}",
+  "newNodeIp": "10.{seq}.0.1",
+  "actor": {
+    "userId": "甲",
+    "nodeId": "svc-a"
+  },
+  "nodes": [
+    {
+      "id": "svc-a",
+      "name": "华北节点",
+      "role": "service",
+      "region": "华北",
+      "ip": "10.1.0.1",
+      "alias": "svc-a",
+      "covers": []
+    },
+    {
+      "id": "svc-b",
+      "name": "华东节点",
+      "role": "service",
+      "region": "华东",
+      "ip": "10.2.0.1",
+      "alias": "svc-b",
+      "covers": []
+    },
+    {
+      "id": "svc-c",
+      "name": "华南节点",
+      "role": "service",
+      "region": "华南",
+      "ip": "10.3.0.1",
+      "alias": "svc-c",
+      "covers": []
+    },
+    {
+      "id": "dr-1",
+      "name": "灾备甲",
+      "role": "dr",
+      "region": "集中",
+      "ip": "10.9.0.1",
+      "alias": "dr-1",
+      "covers": ["svc-a", "svc-b", "svc-c"]
+    }
+  ]
+}
