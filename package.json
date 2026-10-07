@@ -6,6 +6,7 @@
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./sqlite": "./dist/sqlite.js",
     "./config": "./config/default.json"
   },
   "files": [
@@ -15,7 +16,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=20.0.0"
   },
   "scripts": {
     "build": "node scripts/build.js",

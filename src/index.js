@@ -1,2 +1,8 @@
 export { Hive, createHive } from './engine.js'
 export { defaultConfigPath, loadConfig } from './config.js'
+export { MemoryStore } from './memory.js'
+export { FileStore } from './file-store.js'
+export { STORE_METHODS } from './store.js'
+export { startCentral } from './central-node.js'
+export { startService } from './service-node.js'
+export { startDr } from './dr-node.js'
